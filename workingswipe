@@ -1,3 +1,4 @@
+# working swipe but slow
 import numpy as np
 import cv2
 import pyautogui
