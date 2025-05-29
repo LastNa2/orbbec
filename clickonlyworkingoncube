@@ -1,0 +1,869 @@
+import numpy as np
+import cv2
+import pyautogui
+import mediapipe as mp
+from openni import openni2
+import tkinter as tk
+from PIL import ImageGrab, ImageTk, Image
+import threading
+import time
+
+
+class BodyTracker:
+    def __init__(self):
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(static_image_mode=False, model_complexity=1)
+        self.mp_draw = mp.solutions.drawing_utils
+
+    def findBody(self, img, draw=True):
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        self.results = self.pose.process(img_rgb)
+
+        if self.results.pose_landmarks and draw:
+            self.mp_draw.draw_landmarks(img, self.results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
+
+        return img
+
+    def findPosition(self, img):
+        lmList = []
+        if self.results.pose_landmarks:
+            h, w, _ = img.shape
+            for id, lm in enumerate(self.results.pose_landmarks.landmark):
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                lmList.append((id, cx, cy))
+        return lmList
+
+
+class ScreenFieldControlApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Dual Screen Field and Multitouch Control")
+
+        # Screen field selection variables - Now supports two capture regions
+        self.capture_regions = [
+            {"start_x": None, "start_y": None, "end_x": None, "end_y": None, 
+             "selection_made": False}
+            for _ in range(2)
+        ]
+        self.current_region = 0  # Track which region we're currently selecting
+        self.capturing = False
+        self.capture_thread = None
+
+        # Camera square mapping variables - Now supports two 3D squares
+        self.square_data = [
+            {"points_2d": [], "points_3d": [], "grid_points_2d": [], "grid_points_3d": [],
+             "homography_matrix": None, "nearest_grid_point": None}
+            for _ in range(2)
+        ]
+        self.current_square = 0  # Track which square we're currently mapping
+        self.mapping_active = False
+        self.camera_thread = None
+        self.touch_threshold = 50  # Default depth threshold for touch detection (mm)
+        
+        # Grid variables
+        self.grid_resolution = 5  # Fixed grid resolution
+        self.show_grid = True  # Always show grid
+        self.show_depth = True  # Always show depth
+        self.depth_display_mode = 0  # Fixed to all points
+        self.use_grid_depth = True  # Always use grid depth
+        self.grid_search_radius = 30  # Search radius for finding nearest grid point (pixels)
+        self.grid_depth_tolerance = 30  # Tolerance for depth comparison with grid (mm)
+        self.grid_depth_threshold = 30  # Specific threshold for click triggering (mm)
+        self.debug_mode = True  # Always show debug information
+        self.depth_value_limiter = 2000  # Default max acceptable depth value (mm)
+
+        # Wall plane estimation variables
+        self.wall_plane = None  # Will store (a, b, c, d) for plane equation ax + by + cz + d = 0
+        self.calibration_points = []
+        self.calibration_mode = False
+        
+        self.canvas = None
+        self.rect = None
+
+        # Body tracking variables - now always active
+        self.body_tracker = BodyTracker()
+        self.use_body_tracking = True  # Always enabled
+        self.body_click_cooldown = 0
+        self.body_click_threshold = 50  # mm threshold for body click
+        self.body_tracked_point = None  # To store tracked body point for visualization
+        
+        # Track which 3D square/screen each hand is currently controlling
+        self.active_squares = {}  # Will map landmark IDs to active square indexes
+        
+        # Track active touches
+        self.active_touches = {}  # Will store active touch positions by landmark ID
+        self.click_cooldown = {}  # Cooldown timer for each tracked point to prevent rapid clicking
+        
+        # Screen windows for each region
+        self.screen_windows = [None, None]
+        self.screen_labels = [None, None]
+
+        # Create simplified UI with minimal controls
+        control_frame = tk.Frame(root)
+        control_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Add label for region selection instructions
+        region_label = tk.Label(control_frame, text="Select and configure the two regions:")
+        region_label.pack(pady=5)
+        
+        # Region 1 controls
+        region1_frame = tk.LabelFrame(control_frame, text="Region 1")
+        region1_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.choose_screen_button1 = tk.Button(
+            region1_frame, text="Choose Screen Field 1", 
+            command=lambda: self.open_selection_window(0))
+        self.choose_screen_button1.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        self.square_mapping_button1 = tk.Button(
+            region1_frame, text="3D Square Mapping 1", 
+            command=lambda: self.start_square_mapping(0),
+            state=tk.DISABLED)
+        self.square_mapping_button1.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        # Region 2 controls
+        region2_frame = tk.LabelFrame(control_frame, text="Region 2")
+        region2_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.choose_screen_button2 = tk.Button(
+            region2_frame, text="Choose Screen Field 2", 
+            command=lambda: self.open_selection_window(1))
+        self.choose_screen_button2.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        self.square_mapping_button2 = tk.Button(
+            region2_frame, text="3D Square Mapping 2", 
+            command=lambda: self.start_square_mapping(1),
+            state=tk.DISABLED)
+        self.square_mapping_button2.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        # Start capture button for both regions
+        self.start_capture_button = tk.Button(
+            control_frame, text="Start Capture (Both Regions)", 
+            command=self.start_capture, state=tk.DISABLED)
+        self.start_capture_button.pack(pady=5)
+        
+        # Stop button
+        self.stop_button = tk.Button(root, text="Stop All", command=self.stop_all, state=tk.DISABLED)
+        self.stop_button.pack(pady=10)
+
+        # Wall angle related variables
+        self.wall_angle = 0
+        self.normal_vector = None
+        self.use_normal_projection = True
+        self.adaptive_thresholds = True
+        self.angle_sensitivity_factor = 1.0
+        
+        # Coordinate display settings
+        self.show_coordinates = True
+        self.grid_spacing = 50
+        
+        # Multitouch tracking points - track only pinky fingertips (removed index fingertips)
+        self.tracking_landmarks = [
+            20,  # Right pinky fingertip
+            19   # Left pinky fingertip
+        ]
+
+    def draw_coordinate_grid(self, image):
+        """Draw coordinate grid on the image"""
+        h, w = image.shape[:2]
+        grid_img = image.copy()
+        
+        # Draw horizontal lines
+        for y in range(0, h, self.grid_spacing):
+            cv2.line(grid_img, (0, y), (w-1, y), (200, 200, 200, 128), 1)
+            cv2.putText(grid_img, f"{y}", (5, y+15), cv2.FONT_HERSHEY_SIMPLEX, 
+                      0.4, (255, 0, 0), 1)
+            
+        # Draw vertical lines
+        for x in range(0, w, self.grid_spacing):
+            cv2.line(grid_img, (x, 0), (x, h-1), (200, 200, 200, 128), 1)
+            cv2.putText(grid_img, f"{x}", (x+2, 15), cv2.FONT_HERSHEY_SIMPLEX, 
+                      0.4, (255, 0, 0), 1)
+            
+        return grid_img
+        
+    def track_screen_mouse(self, event, region_idx):
+        """Track mouse coordinates on the captured screen"""
+        x, y = event.x, event.y
+        if hasattr(self, 'screen_status_labels') and len(self.screen_status_labels) > region_idx:
+            self.screen_status_labels[region_idx].config(text=f"Region {region_idx+1} | Position: ({x}, {y})")
+
+    def open_selection_window(self, region_idx):
+        # Set current region
+        self.current_region = region_idx
+
+        # Open a fullscreen transparent window for square selection
+        self.selection_window = tk.Toplevel(self.root)
+        self.selection_window.attributes("-fullscreen", True)
+        self.selection_window.attributes("-alpha", 0.3)
+        self.selection_window.configure(bg='black')
+        
+        # Add a label to indicate which region is being selected
+        label = tk.Label(self.selection_window, 
+                       text=f"Selecting Region {region_idx+1} - Click and drag to define square area", 
+                       font=("Arial", 24), fg="white", bg="black")
+        label.pack(pady=50)
+
+        self.canvas = tk.Canvas(self.selection_window, bg='black', highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.selection_window.bind("<Button-1>", self.on_button_press)
+        self.selection_window.bind("<B1-Motion>", self.on_mouse_drag)
+        self.selection_window.bind("<ButtonRelease-1>", self.on_button_release)
+
+    def on_button_press(self, event):
+        # Record the starting point of the square
+        region = self.capture_regions[self.current_region]
+        region["start_x"] = event.x
+        region["start_y"] = event.y
+        
+        if hasattr(self, 'rect') and self.rect:
+            self.canvas.delete(self.rect)
+        self.rect = self.canvas.create_rectangle(
+            region["start_x"], region["start_y"], 
+            region["start_x"], region["start_y"], 
+            outline='red')
+
+    def on_mouse_drag(self, event):
+        # Get current region data
+        region = self.capture_regions[self.current_region]
+        
+        # Enforce square dimensions during drag
+        side_length = max(abs(event.x - region["start_x"]), abs(event.y - region["start_y"]))
+        self.canvas.coords(
+            self.rect, 
+            region["start_x"], region["start_y"], 
+            region["start_x"] + side_length, region["start_y"] + side_length)
+
+    def on_button_release(self, event):
+        # Get current region data
+        region = self.capture_regions[self.current_region]
+        
+        # Finalize the square selection and ensure dimensions are square
+        side_length = max(abs(event.x - region["start_x"]), abs(event.y - region["start_y"]))
+        region["end_x"] = region["start_x"] + side_length
+        region["end_y"] = region["start_y"] + side_length
+        region["selection_made"] = True
+        
+        self.selection_window.destroy()
+        
+        # Enable appropriate buttons
+        if self.current_region == 0:
+            self.square_mapping_button1.config(state=tk.NORMAL)
+        else:
+            self.square_mapping_button2.config(state=tk.NORMAL)
+        
+        # Check if both regions are selected to enable Start Capture button
+        if all(region["selection_made"] for region in self.capture_regions):
+            self.start_capture_button.config(state=tk.NORMAL)
+
+    def start_capture(self):
+        # Check if at least one region is selected
+        if not any(region["selection_made"] for region in self.capture_regions):
+            return
+
+        self.capturing = True
+        self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
+        self.capture_thread.start()
+        self.stop_button.config(state=tk.NORMAL)  # Enable Stop button
+
+    def capture_loop(self):
+        try:
+            # Initialize status labels list
+            self.screen_status_labels = []
+            
+            while self.capturing:
+                # Process each selected region
+                for region_idx, region in enumerate(self.capture_regions):
+                    if not region["selection_made"]:
+                        continue
+                        
+                    # Capture the selected square region
+                    bbox = (region["start_x"], region["start_y"], region["end_x"], region["end_y"])
+                    screen = ImageGrab.grab(bbox)
+                    screen_array = np.array(screen)
+                    
+                    # Draw coordinate grid if enabled
+                    if hasattr(self, 'show_coordinates') and self.show_coordinates:
+                        screen_array = self.draw_coordinate_grid(screen_array)
+                    
+                    tk_image = ImageTk.PhotoImage(Image.fromarray(screen_array))
+
+                    # Display the captured screen dynamically
+                    if self.screen_windows[region_idx] is None:
+                        self.screen_windows[region_idx] = tk.Toplevel(self.root)
+                        self.screen_windows[region_idx].title(f"Captured Region {region_idx+1}")
+                        
+                        self.screen_labels[region_idx] = tk.Label(self.screen_windows[region_idx], image=tk_image)
+                        self.screen_labels[region_idx].image = tk_image
+                        self.screen_labels[region_idx].pack()
+                        
+                        # Add status bar for coordinates info
+                        status_label = tk.Label(self.screen_windows[region_idx], 
+                                            text=f"Region {region_idx+1} | Ready")
+                        status_label.pack(side=tk.BOTTOM, fill=tk.X)
+                        self.screen_status_labels.append(status_label)
+                        
+                        # Add mouse position tracking with region index
+                        self.screen_labels[region_idx].bind("<Motion>", 
+                                                         lambda event, idx=region_idx: self.track_screen_mouse(event, idx))
+                    else:
+                        self.screen_labels[region_idx].config(image=tk_image)
+                        self.screen_labels[region_idx].image = tk_image
+
+                time.sleep(0.05)  # Refresh at 20fps for smooth updates
+        except Exception as e:
+            print(f"Error during screen capture: {e}")
+
+    def start_square_mapping(self, square_idx):
+        if self.mapping_active:
+            return
+
+        self.current_square = square_idx
+        self.mapping_active = True
+        self.square_data[square_idx]["points_2d"] = []  # Reset 2D points
+        self.square_data[square_idx]["points_3d"] = []  # Reset 3D points
+        self.square_data[square_idx]["grid_points_2d"] = []    # Reset grid points
+        self.square_data[square_idx]["grid_points_3d"] = []    # Reset 3D grid points
+        self.square_data[square_idx]["nearest_grid_point"] = None  # Reset nearest grid point
+        
+        self.camera_thread = threading.Thread(target=self.camera_mapping_loop, daemon=True)
+        self.camera_thread.start()
+        self.stop_button.config(state=tk.NORMAL)  # Enable Stop button
+
+    def find_nearest_grid_point(self, hand_pos_2d, square_idx):
+        """Find the nearest grid point to the hand position for a specific square"""
+        square_data = self.square_data[square_idx]
+        if not square_data["grid_points_2d"] or not square_data["grid_points_3d"]:
+            return None
+            
+        hand_x, hand_y = hand_pos_2d
+        
+        nearest_point = None
+        min_distance = float('inf')
+        
+        # Search through all grid points to find the nearest one
+        for i, (grid_x, grid_y) in enumerate(square_data["grid_points_2d"]):
+            # Calculate 2D Euclidean distance
+            distance = np.sqrt((grid_x - hand_x)**2 + (grid_y - hand_y)**2)
+            
+            if distance < min_distance and distance < self.grid_search_radius:
+                min_distance = distance
+                nearest_point = square_data["grid_points_3d"][i]
+        
+        return nearest_point
+
+    def calculate_grid_points(self, square_idx):
+        """Calculate the 3D grid points inside the square"""
+        square_data = self.square_data[square_idx]
+        if len(square_data["points_3d"]) != 4:
+            return
+            
+        # Clear existing grid points
+        square_data["grid_points_2d"] = []
+        square_data["grid_points_3d"] = []
+        
+        # Extract the 4 corner points in 2D
+        corners_2d = np.array(square_data["points_2d"], dtype=np.float32)
+        
+        # Sort corners to ensure consistent order: top-left, top-right, bottom-right, bottom-left
+        center = np.mean(corners_2d, axis=0)
+        relative_positions = corners_2d - center
+        angles = np.arctan2(relative_positions[:, 1], relative_positions[:, 0])
+        sorted_indices = np.argsort(angles)
+        corners_2d = corners_2d[sorted_indices]
+        
+        # Extract 3D points in the same order
+        corners_3d = np.array([square_data["points_3d"][i] for i in sorted_indices])
+        
+        # Generate grid points
+        for i in range(self.grid_resolution + 1):
+            for j in range(self.grid_resolution + 1):
+                # Compute bilinear interpolation parameters
+                u = i / self.grid_resolution
+                v = j / self.grid_resolution
+                
+                # Bilinear interpolation
+                p1 = (1-u)*(1-v)
+                p2 = u*(1-v)
+                p3 = u*v
+                p4 = (1-u)*v
+                
+                # Compute interpolated 2D point
+                x = p1*corners_2d[0][0] + p2*corners_2d[1][0] + p3*corners_2d[2][0] + p4*corners_2d[3][0]
+                y = p1*corners_2d[0][1] + p2*corners_2d[1][1] + p3*corners_2d[2][1] + p4*corners_2d[3][1]
+                
+                # Compute interpolated depth
+                z1 = corners_3d[0][2]
+                z2 = corners_3d[1][2]
+                z3 = corners_3d[2][2]
+                z4 = corners_3d[3][2]
+                z = p1*z1 + p2*z2 + p3*z3 + p4*z4
+                
+                # Store the grid point
+                square_data["grid_points_2d"].append((x, y))
+                square_data["grid_points_3d"].append((x, y, z))
+                    
+        print(f"Generated {len(square_data['grid_points_2d'])} grid points for square {square_idx+1}")
+
+    def camera_mapping_loop(self):
+        try:
+            # Initialize OpenNI2 with the correct path
+            try:
+                openni2.initialize(r'C:\Program Files\vscod\OpenNI_2.3.0.86_202210111950_4c8f5aa4_beta6_windows\Win64-Release\sdk\libs')
+                print("OpenNI2 initialized successfully!")
+            except Exception as e:
+                print(f"Error initializing OpenNI2: {e}")
+                return
+
+            # Open device and streams
+            try:
+                dev = openni2.Device.open_any()
+                print("Device opened successfully!")
+
+                depth_stream = dev.create_depth_stream()
+                depth_stream.start()
+                print("Depth stream started successfully!")
+
+                color_stream = dev.create_color_stream()
+                color_stream.start()
+                print("Color stream started successfully!")
+            except Exception as e:
+                print(f"Failed to initialize streams: {e}")
+                openni2.unload()
+                return
+
+            # Initialize MediaPipe for body pose tracking
+            mp_pose = mp.solutions.pose
+            pose = mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.6)
+            mp_drawing = mp.solutions.drawing_utils
+
+            # OpenCV window for square mapping
+            cv2.namedWindow("Camera Feed")
+            cv2.setMouseCallback("Camera Feed", self.draw_3d_square)
+
+            # Store the latest depth array for use in mouse callback
+            self.latest_depth_array = None
+
+            # Initialize click cooldown for each tracked landmark
+            for lm_idx in self.tracking_landmarks:
+                self.click_cooldown[lm_idx] = 0
+
+            while self.mapping_active:
+                # Capture frames
+                color_frame = color_stream.read_frame()
+                color_data = color_frame.get_buffer_as_uint8()
+                color_image = np.frombuffer(color_data, dtype=np.uint8)
+                color_image.shape = (color_frame.height, color_frame.width, 3)
+                color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+
+                # Get depth frame
+                depth_frame = depth_stream.read_frame()
+                depth_data = depth_frame.get_buffer_as_uint16()
+                depth_array = np.frombuffer(depth_data, dtype=np.uint16)
+                depth_array.shape = (depth_frame.height, depth_frame.width)
+                
+                # Store the latest depth array for the callback
+                self.latest_depth_array = depth_array
+
+                # Draw the 3D square and grid on the camera feed
+                # Create a transparent overlay for the grid
+                overlay = color_image.copy()
+
+                # Draw the 3D squares and grids on the overlay
+                overlay = self.draw_all_3d_squares_on_image(overlay)
+
+                # Blend the overlay with the original image (alpha controls transparency)
+                alpha = 0.4  # Adjust this to make the grid more/less transparent
+                color_image = cv2.addWeighted(overlay, alpha, color_image, 1 - alpha, 0)
+
+                # Body pose tracking (now always active)
+                rgb_frame = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                results = pose.process(rgb_frame)
+
+                # Track body pose and multiple touch points
+                if results.pose_landmarks:
+                    # Draw the pose landmarks on top of everything else
+                    mp_drawing.draw_landmarks(color_image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+                    landmarks = results.pose_landmarks.landmark
+                    frame_height, frame_width = color_image.shape[:2]
+                    
+                    # Process multiple tracking points for multitouch
+                    for lm_idx in self.tracking_landmarks:
+                        landmark = landmarks[lm_idx]
+                        
+                        # Only process landmarks with good visibility
+                        if landmark.visibility < 0.5:
+                            continue
+                            
+                        # Get landmark coordinates in image space
+                        lm_x = int(landmark.x * frame_width)
+                        lm_y = int(landmark.y * frame_height)
+                        
+                        # Label the landmark
+                        cv2.putText(color_image, f"LM{lm_idx}", (lm_x+5, lm_y+5), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                        
+                        # Get depth value at this point
+                        if 0 <= lm_y < depth_array.shape[0] and 0 <= lm_x < depth_array.shape[1]:
+                            depth_val = depth_array[lm_y, lm_x]
+                            if depth_val > 0 and np.isfinite(depth_val):
+                                # Highlight the tracking point
+                                cv2.circle(color_image, (lm_x, lm_y), 7, (0, 255, 0), -1)
+                                cv2.putText(color_image, f"Depth: {depth_val}mm", 
+                                        (lm_x+10, lm_y+25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                                
+                                # Create 3D point (x, y, z)
+                                point_3d = (lm_x, lm_y, depth_val)
+                                
+                                # Check if point is inside any of the projected 3D squares
+                                for square_idx in range(2):
+                                    if len(self.square_data[square_idx]["points_3d"]) == 4:
+                                        is_inside, mapped_pos = self.check_point_in_3d_square(point_3d, square_idx)
+                                        if is_inside:
+                                            # Store which square this landmark is controlling
+                                            self.active_squares[lm_idx] = square_idx
+                                            
+                                            # Visual feedback for active square
+                                            cv2.putText(color_image, f"LM{lm_idx} -> Square {square_idx+1}", 
+                                                    (20, 90 + 30*lm_idx), cv2.FONT_HERSHEY_SIMPLEX, 
+                                                    0.6, (0, 255, 0), 2, cv2.LINE_AA)
+                                            
+                                            # Map point position to corresponding screen coordinates
+                                            screen_x, screen_y = mapped_pos
+                                            region = self.capture_regions[square_idx]
+                                            
+                                            # Find nearest grid point for depth comparison
+                                            nearest_grid_point = self.find_nearest_grid_point((lm_x, lm_y), square_idx)
+                                            
+                                            if nearest_grid_point:
+                                                grid_x, grid_y, grid_depth = nearest_grid_point
+                                                
+                                                # Visual feedback - draw line connecting landmark to nearest grid point
+                                                cv2.line(color_image, (lm_x, lm_y), (int(grid_x), int(grid_y)), 
+                                                        (255, 0, 255), 2)
+                                                cv2.circle(color_image, (int(grid_x), int(grid_y)), 5, 
+                                                        (255, 0, 255), -1)
+                                                
+                                                # Calculate depth difference
+                                                depth_diff = grid_depth - depth_val
+                                                
+                                                # Define threshold for click trigger (negative means hand is closer than grid)
+                                                click_threshold = 800  # mm - reduced threshold for faster triggering
+                                                
+                                                # Decrease cooldown counter more quickly
+                                                if self.click_cooldown[lm_idx] > 0:
+                                                    self.click_cooldown[lm_idx] -= 2  # Decrease by 2 instead of 1 for faster cooldown
+                                                
+                                                # Trigger click when:
+                                                # 1. Hand is closer to camera than grid point by threshold amount
+                                                # 2. Cooldown timer has expired to prevent rapid clicking
+                                                should_click = depth_diff <= click_threshold and self.click_cooldown[lm_idx] <= 0
+                                                
+                                                # Visual feedback for click proximity
+                                                proximity_percentage = min(1.0, max(0.0, abs(depth_diff / click_threshold)))
+                                                proximity_color = (0, int(255 * (1-proximity_percentage)), int(255 * proximity_percentage))
+                                                
+                                                # Circle changes from green to red as you get closer to clicking
+                                                circle_radius = 15 + int(5 * proximity_percentage)
+                                                cv2.circle(color_image, (lm_x, lm_y), circle_radius, proximity_color, 2)
+                                                
+                                                # Handle click action
+                                                if should_click:
+                                                    # Execute click at the mapped screen position
+                                                    pyautogui.click(screen_x, screen_y)
+                                                    
+                                                    # Strong visual feedback for touch
+                                                    cv2.circle(color_image, (lm_x, lm_y), circle_radius, (0, 0, 255), -1)
+                                                    
+                                                    # Set cooldown to prevent rapid clicking (reduced from 10 to 5 frames)
+                                                    self.click_cooldown[lm_idx] = 5
+                                                    
+                                                    # Update active touch dictionary for multitouch tracking
+                                                    self.active_touches[lm_idx] = {
+                                                        "pos": (screen_x, screen_y),
+                                                        "region": square_idx,
+                                                        "time": time.time()
+                                                    }
+                                                    
+                                                    print(f"Click at ({screen_x}, {screen_y}) in region {square_idx+1} from landmark {lm_idx}")
+                                            else:
+                                                cv2.putText(color_image, f"No grid points for Square {square_idx+1}", 
+                                                        (20, 240), cv2.FONT_HERSHEY_SIMPLEX, 
+                                                        0.7, (0, 0, 255), 2, cv2.LINE_AA)
+                                            
+                                            break  # Found the square this point is in, no need to check others
+                                else:
+                                    # If not in any square, remove from active squares
+                                    if lm_idx in self.active_squares:
+                                        del self.active_squares[lm_idx]
+                
+                # Display count of active touch points
+                touch_count = len(self.active_touches)
+                cv2.putText(color_image, f"Active touches: {touch_count}", 
+                        (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                
+                # Basic status information for current square mapping                
+                square_data = self.square_data[self.current_square]
+                if len(square_data["points_3d"]) < 4:
+                    cv2.putText(color_image, f"Click to define 3D square {self.current_square+1}: {len(square_data['points_3d'])}/4 points", 
+                            (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(color_image, f"3D square {self.current_square+1} mapped! Move tracked points inside square.", 
+                            (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                
+                # Clean up old touch points (older than 1 second)
+                current_time = time.time()
+                for lm_id in list(self.active_touches.keys()):
+                    if current_time - self.active_touches[lm_id]["time"] > 1.0:
+                        del self.active_touches[lm_id]
+                
+                # Display keyboard shortcuts as a help message
+                cv2.putText(color_image, "Press: r=reset current square, 1,2=switch square, q=quit", 
+                        (20, color_image.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+                cv2.imshow("Camera Feed", color_image)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('r'):  # Reset current square points
+                    square_data = self.square_data[self.current_square]
+                    square_data["points_2d"] = []
+                    square_data["points_3d"] = []
+                    square_data["grid_points_2d"] = []
+                    square_data["grid_points_3d"] = []
+                    square_data["homography_matrix"] = None
+                elif key == ord('1'):  # Switch to square 1
+                    self.current_square = 0
+                    print("Switched to Square 1")
+                elif key == ord('2'):  # Switch to square 2
+                    self.current_square = 1
+                    print("Switched to Square 2")
+
+            # Cleanup
+            depth_stream.stop()
+            color_stream.stop()
+            openni2.unload()
+            pose.close()
+            cv2.destroyAllWindows()
+        except Exception as e:
+            print(f"Error during square mapping: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def distance_to_wall(self, point_3d):
+        """Calculate distance from a 3D point to the wall plane, optimized for angled walls"""
+        if self.wall_plane is None:
+            return float('inf')
+        
+        a, b, c, d = self.wall_plane
+        numerator = abs(a*point_3d[0] + b*point_3d[1] + c*point_3d[2] + d)
+        denominator = np.sqrt(a*a + b*b + c*c)
+        
+        if denominator < 1e-6:  # Avoid division by zero
+            return float('inf')
+        
+        # Basic perpendicular distance to the plane
+        perp_distance = numerator / denominator
+        
+        if self.use_normal_projection and self.normal_vector is not None:
+            # For angled walls, scale based on the angle sensitivity factor
+            if self.adaptive_thresholds and self.wall_angle > 15:
+                perp_distance = perp_distance / self.angle_sensitivity_factor
+        
+        return perp_distance
+
+    def draw_3d_square(self, event, x, y, flags, param):
+        """Handle clicks for defining 3D square corners"""
+        if event == cv2.EVENT_LBUTTONDOWN and self.mapping_active:
+            square_data = self.square_data[self.current_square]
+            if len(square_data["points_3d"]) < 4:
+                if hasattr(self, 'latest_depth_array') and self.latest_depth_array is not None:
+                    # Get depth value from the click point
+                    if 0 <= y < self.latest_depth_array.shape[0] and 0 <= x < self.latest_depth_array.shape[1]:
+                        depth_value = self.latest_depth_array[y, x]
+                        if depth_value > 0:  # Ensure we have a valid depth value
+                            # Store both 2D and 3D points
+                            square_data["points_2d"].append((x, y))
+                            square_data["points_3d"].append((x, y, depth_value))
+                            print(f"Added 3D square {self.current_square+1} point {len(square_data['points_3d'])}: ({x}, {y}, {int(depth_value)}mm)")
+                            
+                            # If we have 4 points, compute the homography matrix and grid points
+                            if len(square_data["points_2d"]) == 4:
+                                self.compute_perspective_transform(self.current_square)
+                                self.calculate_grid_points(self.current_square)
+                        else:
+                            print(f"Invalid depth value at ({x}, {y}). Please try another point.")
+                    else:
+                        print(f"Point ({x}, {y}) is outside of depth array bounds.")
+
+    def compute_perspective_transform(self, square_idx):
+        """Compute homography matrix for perspective transformation for a specific square"""
+        square_data = self.square_data[square_idx]
+        region = self.capture_regions[square_idx]
+        
+        if len(square_data["points_2d"]) != 4:
+            return
+            
+        # Source points are the 2D points in camera image
+        src_pts = np.array(square_data["points_2d"], dtype=np.float32)
+        
+        # Destination points are the corners of the screen area we selected for this region
+        dst_pts = np.array([
+            [region["start_x"], region["start_y"]],
+            [region["end_x"], region["start_y"]],
+            [region["end_x"], region["end_y"]],
+            [region["start_x"], region["end_y"]]
+        ], dtype=np.float32)
+        
+        # Compute homography matrix
+        square_data["homography_matrix"] = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        print(f"Perspective transform computed for square {square_idx+1}!")
+
+    def check_point_in_3d_square(self, point_3d, square_idx):
+        """Check if a 3D point is inside the mapped 3D square and return mapped position"""
+        square_data = self.square_data[square_idx]
+        region = self.capture_regions[square_idx]
+        
+        if len(square_data["points_3d"]) != 4 or square_data["homography_matrix"] is None:
+            return False, (0, 0)
+            
+        x, y, z = point_3d
+        
+        # First, check if the point is near the wall plane
+        if self.wall_plane is not None:
+            distance_to_wall = self.distance_to_wall(point_3d)
+            if distance_to_wall > 100:  # Point is too far from wall plane (100mm threshold)
+                return False, (0, 0)
+        
+        # Use perspective transform to map the 2D point to screen coordinates
+        point_2d = np.array([[x, y]], dtype=np.float32)
+        transformed_point = cv2.perspectiveTransform(point_2d.reshape(-1, 1, 2), square_data["homography_matrix"])
+        screen_x, screen_y = transformed_point[0][0]
+        
+        # Check if the mapped point is within this region's screen area
+        if (region["start_x"] <= screen_x <= region["end_x"] and 
+            region["start_y"] <= screen_y <= region["end_y"]):
+            return True, (screen_x, screen_y)
+        
+        return False, (0, 0)
+
+    def get_depth_color(self, depth_value, min_depth=700, max_depth=1500):
+        """Get color based on depth value (green-yellow-red gradient)"""
+        # Normalize depth to 0-1 range
+        normalized = max(0, min(1, (depth_value - min_depth) / (max_depth - min_depth)))
+        
+        # Create color gradient: green (0) -> yellow (0.5) -> red (1)
+        if normalized < 0.5:
+            # Green to yellow
+            r = int(255 * (2 * normalized))
+            g = 255
+            b = 0
+        else:
+            # Yellow to red
+            r = 255
+            g = int(255 * (2 - 2 * normalized))
+            b = 0
+            
+        return (b, g, r)  # OpenCV uses BGR
+
+    def draw_all_3d_squares_on_image(self, image):
+        """Draw all defined 3D squares and grids on the image"""
+        # Define different colors for each square
+        square_colors = [(0, 255, 0), (255, 0, 0)]  # Green for square 1, Blue for square 2
+        
+        for square_idx in range(2):
+            square_data = self.square_data[square_idx]
+            color = square_colors[square_idx]
+            
+            # Draw individual corner points
+            for i, point in enumerate(square_data["points_3d"]):
+                if i < len(square_data["points_3d"]):
+                    x, y, z = point
+                    cv2.circle(image, (int(x), int(y)), 5, color, -1)
+                    cv2.putText(image, f"S{square_idx+1}P{i+1}: {int(z)}mm", 
+                              (int(x)+10, int(y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
+            # Draw complete square if we have 4 points
+            if len(square_data["points_2d"]) == 4:
+                # Draw lines connecting the points
+                pts = np.array(square_data["points_2d"], np.int32).reshape((-1, 1, 2))
+                cv2.polylines(image, [pts], isClosed=True, color=color, thickness=2)
+                
+                # Add label for the square
+                centroid = np.mean(pts, axis=0)[0].astype(int)
+                cv2.putText(image, f"Square {square_idx+1}", 
+                          (centroid[0]-30, centroid[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+                # Draw grid if we have grid points
+                if len(square_data["grid_points_2d"]) > 0:
+                    # Draw grid lines
+                    grid_points = np.array(square_data["grid_points_2d"], dtype=np.int32)
+                    
+                    # Get min and max depth for color mapping
+                    depths = [point[2] for point in square_data["grid_points_3d"]]
+                    min_depth = min(depths)
+                    max_depth = max(depths)
+                    
+                    # Draw horizontal grid lines
+                    for i in range(self.grid_resolution + 1):
+                        row_points = grid_points[i*(self.grid_resolution+1):(i+1)*(self.grid_resolution+1)]
+                        row_depths = [square_data["grid_points_3d"][i*(self.grid_resolution+1)+j][2] 
+                                     for j in range(self.grid_resolution+1)]
+                        
+                        for j in range(len(row_points)-1):
+                            pt1 = tuple(np.int32(row_points[j]))
+                            pt2 = tuple(np.int32(row_points[j+1]))
+                            
+                            # Color lines based on average depth
+                            avg_depth = (row_depths[j] + row_depths[j+1]) / 2
+                            line_color = self.get_depth_color(avg_depth, min_depth, max_depth)
+                            cv2.line(image, pt1, pt2, line_color, 1)
+                    
+                    # Draw vertical grid lines
+                    for j in range(self.grid_resolution + 1):
+                        col_points = [grid_points[i*(self.grid_resolution+1)+j] for i in range(self.grid_resolution+1)]
+                        col_depths = [square_data["grid_points_3d"][i*(self.grid_resolution+1)+j][2] 
+                                     for i in range(self.grid_resolution+1)]
+                        
+                        for i in range(len(col_points)-1):
+                            pt1 = tuple(np.int32(col_points[i]))
+                            pt2 = tuple(np.int32(col_points[i+1]))
+                            
+                            # Color lines based on average depth
+                            avg_depth = (col_depths[i] + col_depths[i+1]) / 2
+                            line_color = self.get_depth_color(avg_depth, min_depth, max_depth)
+                            cv2.line(image, pt1, pt2, line_color, 1)
+
+        return image
+
+    def stop_all(self):
+        # Stop all operations
+        self.capturing = False
+        self.mapping_active = False
+        self.calibration_mode = False
+        
+        # Close windows
+        for i in range(2):
+            if self.screen_windows[i] is not None:
+                try:
+                    self.screen_windows[i].destroy()
+                    self.screen_windows[i] = None
+                    self.screen_labels[i] = None
+                except:
+                    pass
+                
+        # Close all OpenCV windows
+        cv2.destroyAllWindows()
+                
+        self.stop_button.config(state=tk.DISABLED)
+        print("Stopped all operations.")
+
+# Main function
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ScreenFieldControlApp(root)
+    root.mainloop()
