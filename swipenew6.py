@@ -1,0 +1,808 @@
+import numpy as np
+import cv2
+import pyautogui
+import mediapipe as mp
+from openni import openni2
+import tkinter as tk
+from PIL import ImageGrab, ImageTk, Image
+import threading
+import time
+from collections import deque
+from datetime import datetime
+import os
+
+# Disable PyAutoGUI safety features for speed
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.001  # Reduce pause between actions
+
+
+class FastGestureTracker:
+    def __init__(self, max_path_length=20):  # Reduced from 50
+        self.paths = {}
+        self.max_path_length = max_path_length
+        self.gesture_buffer = {}
+        self.swipe_threshold = 25  # Reduced sensitivity
+        self.circle_threshold = 0.7
+        
+    def add_screen_point(self, landmark_id, screen_point, timestamp):
+        """Optimized point addition"""
+        if landmark_id not in self.paths:
+            self.paths[landmark_id] = deque(maxlen=self.max_path_length)
+            self.gesture_buffer[landmark_id] = deque(maxlen=10)  # Reduced buffer
+        
+        self.paths[landmark_id].append({
+            'point': screen_point,
+            'timestamp': timestamp
+        })
+        self.gesture_buffer[landmark_id].append({
+            'point': screen_point,
+            'timestamp': timestamp
+        })
+    
+    def detect_gesture_fast(self, landmark_id):
+        """Fast gesture detection with reduced complexity"""
+        if landmark_id not in self.gesture_buffer or len(self.gesture_buffer[landmark_id]) < 3:
+            return "line"  # Default to line for speed
+        
+        points = [p['point'] for p in self.gesture_buffer[landmark_id]]
+        if len(points) < 3:
+            return "line"
+        
+        # Quick circle detection
+        if len(points) >= 6:
+            start = np.array(points[0])
+            end = np.array(points[-1])
+            if np.linalg.norm(start - end) < 60:  # Quick circle check
+                return "circle"
+        
+        return "line"  # Default to line for speed
+    
+    def clear_path(self, landmark_id):
+        if landmark_id in self.paths:
+            self.paths[landmark_id].clear()
+        if landmark_id in self.gesture_buffer:
+            self.gesture_buffer[landmark_id].clear()
+
+
+class BodyTracker:
+    def __init__(self):
+        self.mp_pose = mp.solutions.pose
+        # Optimized pose settings for speed
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False, 
+            model_complexity=0,  # Reduced from 1 to 0 for speed
+            smooth_landmarks=True,
+            enable_segmentation=False,
+            smooth_segmentation=False,
+            min_detection_confidence=0.5,  # Reduced from 0.7
+            min_tracking_confidence=0.5   # Reduced from 0.6
+        )
+        self.mp_draw = mp.solutions.drawing_utils
+
+    def findBody(self, img, draw=True):
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        self.results = self.pose.process(img_rgb)
+
+        if self.results.pose_landmarks and draw:
+            self.mp_draw.draw_landmarks(img, self.results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
+
+        return img
+
+    def findPosition(self, img):
+        lmList = []
+        if self.results.pose_landmarks:
+            h, w, _ = img.shape
+            for id, lm in enumerate(self.results.pose_landmarks.landmark):
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                lmList.append((id, cx, cy))
+        return lmList
+
+
+class ScreenFieldControlApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Optimized Multitouch Control - User: LastNa2")
+        
+        # Session info
+        self.session_start_time = datetime.now()
+        self.current_user = "LastNa2"
+        
+        self.capture_regions = [
+            {"start_x": None, "start_y": None, "end_x": None, "end_y": None, 
+             "selection_made": False}
+            for _ in range(2)
+        ]
+        self.current_region = 0
+        self.capturing = False
+        self.capture_thread = None
+
+        self.square_data = [
+            {"points_2d": [], "points_3d": [], "grid_points_2d": [], "grid_points_3d": [],
+             "homography_matrix": None, "nearest_grid_point": None}
+            for _ in range(2)
+        ]
+        self.current_square = 0
+        self.mapping_active = False
+        self.camera_thread = None
+        self.touch_threshold = 50
+        
+        # Optimized grid settings
+        self.grid_resolution = 3  # Reduced from 5 for speed
+        self.show_grid = True
+        self.show_depth = False  # Disabled for speed
+        self.depth_display_mode = 0
+        self.use_grid_depth = True
+        self.grid_search_radius = 25  # Reduced from 30
+        self.grid_depth_tolerance = 30
+        self.grid_depth_threshold = 30
+        self.debug_mode = False  # Disabled for speed
+        self.depth_value_limiter = 2000
+
+        self.wall_plane = None
+        self.calibration_points = []
+        self.calibration_mode = False
+        
+        self.canvas = None
+        self.rect = None
+
+        self.body_tracker = BodyTracker()
+        self.use_body_tracking = True
+        self.body_click_cooldown = 0
+        self.body_click_threshold = 50
+        self.body_tracked_point = None
+        
+        # Fast gesture tracking
+        self.gesture_tracker = FastGestureTracker()
+        self.active_squares = {}
+        self.active_touches = {}
+        self.click_cooldown = {}
+        self.swipe_states = {}
+        self.last_position = {}
+        
+        # Optimized swipe settings
+        self.swipe_smoothing = True
+        self.movement_threshold = 3  # Slightly increased to reduce jitter
+        self.max_smoothing_steps = 5  # Reduced from 10
+        self.drawing_precision = "medium"
+        
+        # Performance optimization flags
+        self.skip_frame_counter = 0
+        self.frame_skip_rate = 1  # Process every frame (can increase to skip frames)
+        
+        self.screen_windows = [None, None]
+        self.screen_labels = [None, None]
+
+        self.setup_ui()
+
+        self.wall_angle = 0
+        self.normal_vector = None
+        self.use_normal_projection = True
+        self.adaptive_thresholds = True
+        self.angle_sensitivity_factor = 1.0
+        
+        self.show_coordinates = False  # Disabled for speed
+        self.grid_spacing = 50
+        
+        self.tracking_landmarks = [20, 19]
+
+        # Initialize swipe states
+        for lm_idx in self.tracking_landmarks:
+            self.swipe_states[lm_idx] = "idle"
+
+    def setup_ui(self):
+        """Optimized UI setup"""
+        # Simplified header
+        header_frame = tk.Frame(self.root, bg='lightgray')
+        header_frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        session_info = f"User: {self.current_user} | Optimized Mode"
+        tk.Label(header_frame, text=session_info, font=("Arial", 10), bg='lightgray').pack(side=tk.LEFT)
+        
+        control_frame = tk.Frame(self.root)
+        control_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        region_label = tk.Label(control_frame, text="Fast Mode - Select regions:")
+        region_label.pack(pady=5)
+        
+        # Simplified controls
+        region1_frame = tk.LabelFrame(control_frame, text="Region 1")
+        region1_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.choose_screen_button1 = tk.Button(
+            region1_frame, text="Choose Screen Field 1", 
+            command=lambda: self.open_selection_window(0))
+        self.choose_screen_button1.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        self.square_mapping_button1 = tk.Button(
+            region1_frame, text="3D Square Mapping 1", 
+            command=lambda: self.start_square_mapping(0),
+            state=tk.DISABLED)
+        self.square_mapping_button1.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        region2_frame = tk.LabelFrame(control_frame, text="Region 2")
+        region2_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.choose_screen_button2 = tk.Button(
+            region2_frame, text="Choose Screen Field 2", 
+            command=lambda: self.open_selection_window(1))
+        self.choose_screen_button2.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        self.square_mapping_button2 = tk.Button(
+            region2_frame, text="3D Square Mapping 2", 
+            command=lambda: self.start_square_mapping(1),
+            state=tk.DISABLED)
+        self.square_mapping_button2.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        self.start_capture_button = tk.Button(
+            control_frame, text="Start Capture (Both Regions)", 
+            command=self.start_capture, state=tk.DISABLED)
+        self.start_capture_button.pack(pady=5)
+        
+        self.stop_button = tk.Button(self.root, text="Stop All", command=self.stop_all, state=tk.DISABLED)
+        self.stop_button.pack(pady=10)
+
+    def fast_cursor_movement(self, target_pos):
+        """Ultra-fast cursor movement without smoothing delays"""
+        pyautogui.moveTo(int(target_pos[0]), int(target_pos[1]))
+
+    def optimized_drawing_logic(self, lm_idx, screen_x, screen_y, should_click, current_time, 
+                               color_image, lm_x, lm_y, circle_radius, square_idx):
+        """Optimized drawing logic with minimal processing"""
+        
+        if should_click:
+            if self.swipe_states[lm_idx] == "idle":
+                pyautogui.moveTo(screen_x, screen_y)
+                pyautogui.mouseDown()
+                self.swipe_states[lm_idx] = "swiping"
+                self.last_position[lm_idx] = (screen_x, screen_y)
+            else:
+                last_x, last_y = self.last_position.get(lm_idx, (screen_x, screen_y))
+                distance = abs(screen_x - last_x) + abs(screen_y - last_y)  # Manhattan distance for speed
+                
+                if distance > self.movement_threshold:
+                    # Fast movement without complex smoothing
+                    if self.swipe_smoothing and distance > 10:
+                        # Simple 2-step smoothing for large movements
+                        mid_x = (last_x + screen_x) // 2
+                        mid_y = (last_y + screen_y) // 2
+                        pyautogui.moveTo(mid_x, mid_y)
+                        time.sleep(0.001)
+                    
+                    pyautogui.moveTo(screen_x, screen_y)
+                    self.last_position[lm_idx] = (screen_x, screen_y)
+            
+            # Minimal visual feedback
+            cv2.circle(color_image, (lm_x, lm_y), 10, (0, 0, 255), -1)
+            
+            self.active_touches[lm_idx] = {
+                "pos": (screen_x, screen_y),
+                "region": square_idx,
+                "time": current_time
+            }
+
+        else:
+            if self.swipe_states[lm_idx] == "swiping":
+                pyautogui.mouseUp()
+                self.swipe_states[lm_idx] = "idle"
+                self.click_cooldown[lm_idx] = 15  # Reduced cooldown
+                
+                if lm_idx in self.last_position:
+                    del self.last_position[lm_idx]
+
+    def draw_coordinate_grid(self, image):
+        """Simplified grid drawing"""
+        if not self.show_coordinates:
+            return image
+        
+        h, w = image.shape[:2]
+        # Draw only major grid lines for speed
+        for y in range(0, h, self.grid_spacing * 2):
+            cv2.line(image, (0, y), (w-1, y), (200, 200, 200), 1)
+        for x in range(0, w, self.grid_spacing * 2):
+            cv2.line(image, (x, 0), (x, h-1), (200, 200, 200), 1)
+        return image
+        
+    def track_screen_mouse(self, event, region_idx):
+        x, y = event.x, event.y
+        if hasattr(self, 'screen_status_labels') and len(self.screen_status_labels) > region_idx:
+            self.screen_status_labels[region_idx].config(text=f"Region {region_idx+1} | Position: ({x}, {y})")
+
+    def open_selection_window(self, region_idx):
+        self.current_region = region_idx
+
+        self.selection_window = tk.Toplevel(self.root)
+        self.selection_window.attributes("-fullscreen", True)
+        self.selection_window.attributes("-alpha", 0.3)
+        self.selection_window.configure(bg='black')
+        
+        label = tk.Label(self.selection_window, 
+                       text=f"Fast Mode - Region {region_idx+1} Selection", 
+                       font=("Arial", 24), fg="white", bg="black")
+        label.pack(pady=50)
+
+        self.canvas = tk.Canvas(self.selection_window, bg='black', highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.selection_window.bind("<Button-1>", self.on_button_press)
+        self.selection_window.bind("<B1-Motion>", self.on_mouse_drag)
+        self.selection_window.bind("<ButtonRelease-1>", self.on_button_release)
+
+    def on_button_press(self, event):
+        region = self.capture_regions[self.current_region]
+        region["start_x"] = event.x
+        region["start_y"] = event.y
+        
+        if hasattr(self, 'rect') and self.rect:
+            self.canvas.delete(self.rect)
+        self.rect = self.canvas.create_rectangle(
+            region["start_x"], region["start_y"], 
+            region["start_x"], region["start_y"], 
+            outline='red')
+
+    def on_mouse_drag(self, event):
+        region = self.capture_regions[self.current_region]
+        
+        side_length = max(abs(event.x - region["start_x"]), abs(event.y - region["start_y"]))
+        self.canvas.coords(
+            self.rect, 
+            region["start_x"], region["start_y"], 
+            region["start_x"] + side_length, region["start_y"] + side_length)
+
+    def on_button_release(self, event):
+        region = self.capture_regions[self.current_region]
+        
+        side_length = max(abs(event.x - region["start_x"]), abs(event.y - region["start_y"]))
+        region["end_x"] = region["start_x"] + side_length
+        region["end_y"] = region["start_y"] + side_length
+        region["selection_made"] = True
+        
+        self.selection_window.destroy()
+        
+        if self.current_region == 0:
+            self.square_mapping_button1.config(state=tk.NORMAL)
+        else:
+            self.square_mapping_button2.config(state=tk.NORMAL)
+        
+        if all(region["selection_made"] for region in self.capture_regions):
+            self.start_capture_button.config(state=tk.NORMAL)
+
+    def start_capture(self):
+        if not any(region["selection_made"] for region in self.capture_regions):
+            return
+
+        self.capturing = True
+        self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
+        self.capture_thread.start()
+        self.stop_button.config(state=tk.NORMAL)
+
+    def capture_loop(self):
+        """Optimized capture loop"""
+        try:
+            self.screen_status_labels = []
+            
+            while self.capturing:
+                for region_idx, region in enumerate(self.capture_regions):
+                    if not region["selection_made"]:
+                        continue
+                        
+                    bbox = (region["start_x"], region["start_y"], region["end_x"], region["end_y"])
+                    screen = ImageGrab.grab(bbox)
+                    screen_array = np.array(screen)
+                    
+                    # Skip coordinate grid for speed
+                    
+                    tk_image = ImageTk.PhotoImage(Image.fromarray(screen_array))
+
+                    if self.screen_windows[region_idx] is None:
+                        self.screen_windows[region_idx] = tk.Toplevel(self.root)
+                        self.screen_windows[region_idx].title(f"Region {region_idx+1} - Fast Mode")
+                        
+                        self.screen_labels[region_idx] = tk.Label(self.screen_windows[region_idx], image=tk_image)
+                        self.screen_labels[region_idx].image = tk_image
+                        self.screen_labels[region_idx].pack()
+                        
+                        status_label = tk.Label(self.screen_windows[region_idx], 
+                                            text=f"Region {region_idx+1} | Fast Mode")
+                        status_label.pack(side=tk.BOTTOM, fill=tk.X)
+                        self.screen_status_labels.append(status_label)
+                    else:
+                        self.screen_labels[region_idx].config(image=tk_image)
+                        self.screen_labels[region_idx].image = tk_image
+
+                time.sleep(0.03)  # Increased refresh rate (33fps)
+        except Exception as e:
+            print(f"Error during screen capture: {e}")
+
+    def start_square_mapping(self, square_idx):
+        if self.mapping_active:
+            return
+
+        self.current_square = square_idx
+        self.mapping_active = True
+        self.square_data[square_idx]["points_2d"] = []
+        self.square_data[square_idx]["points_3d"] = []
+        self.square_data[square_idx]["grid_points_2d"] = []
+        self.square_data[square_idx]["grid_points_3d"] = []
+        self.square_data[square_idx]["nearest_grid_point"] = None
+        
+        self.camera_thread = threading.Thread(target=self.optimized_camera_loop, daemon=True)
+        self.camera_thread.start()
+        self.stop_button.config(state=tk.NORMAL)
+
+    def find_nearest_grid_point_fast(self, hand_pos_2d, square_idx):
+        """Optimized grid point search"""
+        square_data = self.square_data[square_idx]
+        if not square_data["grid_points_3d"]:
+            return None
+            
+        hand_x, hand_y = hand_pos_2d
+        
+        # Use numpy for faster computation
+        if hasattr(self, 'grid_points_array') and square_idx in self.grid_points_array:
+            points_2d = self.grid_points_array[square_idx]
+            distances = np.sum((points_2d - np.array([hand_x, hand_y]))**2, axis=1)
+            min_idx = np.argmin(distances)
+            
+            if distances[min_idx] < self.grid_search_radius**2:
+                return square_data["grid_points_3d"][min_idx]
+        
+        return None
+
+    def calculate_grid_points(self, square_idx):
+        """Optimized grid calculation"""
+        square_data = self.square_data[square_idx]
+        if len(square_data["points_3d"]) != 4:
+            return
+            
+        square_data["grid_points_2d"] = []
+        square_data["grid_points_3d"] = []
+        
+        corners_2d = np.array(square_data["points_2d"], dtype=np.float32)
+        
+        center = np.mean(corners_2d, axis=0)
+        relative_positions = corners_2d - center
+        angles = np.arctan2(relative_positions[:, 1], relative_positions[:, 0])
+        sorted_indices = np.argsort(angles)
+        corners_2d = corners_2d[sorted_indices]
+        
+        corners_3d = np.array([square_data["points_3d"][i] for i in sorted_indices])
+        
+        for i in range(self.grid_resolution + 1):
+            for j in range(self.grid_resolution + 1):
+                u = i / self.grid_resolution
+                v = j / self.grid_resolution
+                
+                p1 = (1-u)*(1-v)
+                p2 = u*(1-v)
+                p3 = u*v
+                p4 = (1-u)*v
+                
+                x = p1*corners_2d[0][0] + p2*corners_2d[1][0] + p3*corners_2d[2][0] + p4*corners_2d[3][0]
+                y = p1*corners_2d[0][1] + p2*corners_2d[1][1] + p3*corners_2d[2][1] + p4*corners_2d[3][1]
+                
+                z1 = corners_3d[0][2]
+                z2 = corners_3d[1][2]
+                z3 = corners_3d[2][2]
+                z4 = corners_3d[3][2]
+                z = p1*z1 + p2*z2 + p3*z3 + p4*z4
+                
+                square_data["grid_points_2d"].append((x, y))
+                square_data["grid_points_3d"].append((x, y, z))
+        
+        # Cache grid points as numpy array for faster searching
+        if not hasattr(self, 'grid_points_array'):
+            self.grid_points_array = {}
+        self.grid_points_array[square_idx] = np.array(square_data["grid_points_2d"])
+        
+        print(f"Generated {len(square_data['grid_points_2d'])} grid points for square {square_idx+1}")
+
+    def optimized_camera_loop(self):
+        """Heavily optimized camera processing loop"""
+        try:
+            try:
+                openni2.initialize(r'C:\Users\dell laptop\vscod\OpenNI_2.3.0.86_202210111950_4c8f5aa4_beta6_windows\Win64-Release\sdk\libs')
+                print("OpenNI2 initialized successfully!")
+            except Exception as e:
+                print(f"Error initializing OpenNI2: {e}")
+                return
+
+            try:
+                dev = openni2.Device.open_any()
+                print("Device opened successfully!")
+
+                depth_stream = dev.create_depth_stream()
+                depth_stream.start()
+                print("Depth stream started successfully!")
+
+                color_stream = dev.create_color_stream()
+                color_stream.start()
+                print("Color stream started successfully!")
+            except Exception as e:
+                print(f"Failed to initialize streams: {e}")
+                openni2.unload()
+                return
+
+            mp_pose = mp.solutions.pose
+            pose = mp_pose.Pose(
+                static_image_mode=False,
+                model_complexity=0,  # Fastest model
+                smooth_landmarks=True,
+                enable_segmentation=False,
+                smooth_segmentation=False,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            mp_drawing = mp.solutions.drawing_utils
+
+            cv2.namedWindow("Camera Feed - Fast Mode")
+            cv2.setMouseCallback("Camera Feed - Fast Mode", self.draw_3d_square)
+
+            self.latest_depth_array = None
+
+            for lm_idx in self.tracking_landmarks:
+                self.click_cooldown[lm_idx] = 0
+
+            frame_count = 0
+            last_fps_time = time.time()
+
+            while self.mapping_active:
+                frame_start = time.time()
+                
+                # Skip frame processing for speed if needed
+                self.skip_frame_counter += 1
+                if self.skip_frame_counter % self.frame_skip_rate != 0:
+                    continue
+
+                color_frame = color_stream.read_frame()
+                color_data = color_frame.get_buffer_as_uint8()
+                color_image = np.frombuffer(color_data, dtype=np.uint8)
+                color_image.shape = (color_frame.height, color_frame.width, 3)
+                color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+
+                depth_frame = depth_stream.read_frame()
+                depth_data = depth_frame.get_buffer_as_uint16()
+                depth_array = np.frombuffer(depth_data, dtype=np.uint16)
+                depth_array.shape = (depth_frame.height, depth_frame.width)
+                
+                self.latest_depth_array = depth_array
+
+                # Simplified overlay processing
+                overlay = self.draw_minimal_squares(color_image)
+                color_image = cv2.addWeighted(overlay, 0.3, color_image, 0.7, 0)
+
+                rgb_frame = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                results = pose.process(rgb_frame)
+
+                current_time = time.time()
+
+                if results.pose_landmarks:
+                    # Minimal landmark drawing
+                    landmarks = results.pose_landmarks.landmark
+                    frame_height, frame_width = color_image.shape[:2]
+                    
+                    for lm_idx in self.tracking_landmarks:
+                        landmark = landmarks[lm_idx]
+                        
+                        if landmark.visibility < 0.5:
+                            continue
+                            
+                        lm_x = int(landmark.x * frame_width)
+                        lm_y = int(landmark.y * frame_height)
+                        
+                        # Minimal visual feedback
+                        cv2.circle(color_image, (lm_x, lm_y), 5, (0, 255, 0), -1)
+                        
+                        if 0 <= lm_y < depth_array.shape[0] and 0 <= lm_x < depth_array.shape[1]:
+                            depth_val = depth_array[lm_y, lm_x]
+                            if depth_val > 0 and np.isfinite(depth_val):
+                                point_3d = (lm_x, lm_y, depth_val)
+                                
+                                for square_idx in range(2):
+                                    if len(self.square_data[square_idx]["points_3d"]) == 4:
+                                        is_inside, mapped_pos = self.check_point_in_3d_square(point_3d, square_idx)
+                                        if is_inside:
+                                            screen_x, screen_y = mapped_pos
+                                            
+                                            nearest_grid_point = self.find_nearest_grid_point_fast((lm_x, lm_y), square_idx)
+                                            
+                                            if nearest_grid_point:
+                                                grid_x, grid_y, grid_depth = nearest_grid_point
+                                                depth_diff = grid_depth - depth_val
+                                                click_threshold = 700  # Reduced threshold for faster response
+                                                
+                                                if self.click_cooldown[lm_idx] > 0:
+                                                    self.click_cooldown[lm_idx] -= 3  # Faster cooldown reduction
+                                                
+                                                should_click = depth_diff <= click_threshold and self.click_cooldown[lm_idx] <= 0
+                                                
+                                                # Optimized drawing logic
+                                                self.optimized_drawing_logic(lm_idx, screen_x, screen_y, should_click, 
+                                                                            current_time, color_image, lm_x, lm_y, 
+                                                                            10, square_idx)
+                                            break
+                                else:
+                                    if lm_idx in self.active_squares:
+                                        del self.active_squares[lm_idx]
+                                    if self.swipe_states[lm_idx] == "swiping":
+                                        pyautogui.mouseUp()
+                                        self.swipe_states[lm_idx] = "idle"
+                                        if lm_idx in self.last_position:
+                                            del self.last_position[lm_idx]
+
+                # Minimal UI feedback
+                active_drawings = sum(1 for state in self.swipe_states.values() if state == "swiping")
+                cv2.putText(color_image, f"Fast Mode | Active: {active_drawings}", 
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # FPS counter
+                frame_count += 1
+                if frame_count % 30 == 0:
+                    fps = 30 / (current_time - last_fps_time)
+                    last_fps_time = current_time
+                    cv2.putText(color_image, f"FPS: {fps:.1f}", 
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                cv2.imshow("Camera Feed - Fast Mode", color_image)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('r'):
+                    square_data = self.square_data[self.current_square]
+                    square_data["points_2d"] = []
+                    square_data["points_3d"] = []
+                    square_data["grid_points_2d"] = []
+                    square_data["grid_points_3d"] = []
+                    square_data["homography_matrix"] = None
+                elif key == ord('1'):
+                    self.current_square = 0
+                elif key == ord('2'):
+                    self.current_square = 1
+
+                # Frame rate limiting for consistent performance
+                frame_time = time.time() - frame_start
+                target_frame_time = 1.0 / 60  # Target 60 FPS
+                if frame_time < target_frame_time:
+                    time.sleep(target_frame_time - frame_time)
+
+            # Cleanup
+            for lm_idx in self.tracking_landmarks:
+                if self.swipe_states[lm_idx] == "swiping":
+                    pyautogui.mouseUp()
+
+            depth_stream.stop()
+            color_stream.stop()
+            openni2.unload()
+            pose.close()
+            cv2.destroyAllWindows()
+        except Exception as e:
+            print(f"Error during square mapping: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def draw_minimal_squares(self, image):
+        """Minimal square drawing for performance"""
+        overlay = image.copy()
+        square_colors = [(0, 255, 0), (255, 0, 0)]
+        
+        for square_idx in range(2):
+            square_data = self.square_data[square_idx]
+            color = square_colors[square_idx]
+            
+            # Only draw corner points
+            for i, point in enumerate(square_data["points_3d"]):
+                x, y, z = point
+                cv2.circle(overlay, (int(x), int(y)), 3, color, -1)
+            
+            # Draw square outline only
+            if len(square_data["points_2d"]) == 4:
+                pts = np.array(square_data["points_2d"], np.int32).reshape((-1, 1, 2))
+                cv2.polylines(overlay, [pts], isClosed=True, color=color, thickness=1)
+
+        return overlay
+
+    def distance_to_wall(self, point_3d):
+        if self.wall_plane is None:
+            return float('inf')
+        
+        a, b, c, d = self.wall_plane
+        numerator = abs(a*point_3d[0] + b*point_3d[1] + c*point_3d[2] + d)
+        denominator = np.sqrt(a*a + b*b + c*c)
+        
+        if denominator < 1e-6:
+            return float('inf')
+
+        perp_distance = numerator / denominator
+        
+        if self.use_normal_projection and self.normal_vector is not None:
+            if self.adaptive_thresholds and self.wall_angle > 15:
+                perp_distance = perp_distance / self.angle_sensitivity_factor
+        
+        return perp_distance
+
+    def draw_3d_square(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and self.mapping_active:
+            square_data = self.square_data[self.current_square]
+            if len(square_data["points_3d"]) < 4:
+                if hasattr(self, 'latest_depth_array') and self.latest_depth_array is not None:
+                    if 0 <= y < self.latest_depth_array.shape[0] and 0 <= x < self.latest_depth_array.shape[1]:
+                        depth_value = self.latest_depth_array[y, x]
+                        if depth_value > 0:
+                            square_data["points_2d"].append((x, y))
+                            square_data["points_3d"].append((x, y, depth_value))
+                            print(f"Added point {len(square_data['points_3d'])}: ({x}, {y}, {int(depth_value)}mm)")
+                            
+                            if len(square_data["points_2d"]) == 4:
+                                self.compute_perspective_transform(self.current_square)
+                                self.calculate_grid_points(self.current_square)
+
+    def compute_perspective_transform(self, square_idx):
+        square_data = self.square_data[square_idx]
+        region = self.capture_regions[square_idx]
+        
+        if len(square_data["points_2d"]) != 4:
+            return
+            
+        src_pts = np.array(square_data["points_2d"], dtype=np.float32)
+        
+        dst_pts = np.array([
+            [region["start_x"], region["start_y"]],
+            [region["end_x"], region["start_y"]],
+            [region["end_x"], region["end_y"]],
+            [region["start_x"], region["end_y"]]
+        ], dtype=np.float32)
+        
+        square_data["homography_matrix"] = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        print(f"Perspective transform computed for square {square_idx+1}!")
+
+    def check_point_in_3d_square(self, point_3d, square_idx):
+        square_data = self.square_data[square_idx]
+        region = self.capture_regions[square_idx]
+        
+        if len(square_data["points_3d"]) != 4 or square_data["homography_matrix"] is None:
+            return False, (0, 0)
+            
+        x, y, z = point_3d
+        
+        point_2d = np.array([[x, y]], dtype=np.float32)
+        transformed_point = cv2.perspectiveTransform(point_2d.reshape(-1, 1, 2), square_data["homography_matrix"])
+        screen_x, screen_y = transformed_point[0][0]
+        
+        if (region["start_x"] <= screen_x <= region["end_x"] and 
+            region["start_y"] <= screen_y <= region["end_y"]):
+            return True, (screen_x, screen_y)
+        
+        return False, (0, 0)
+
+    def stop_all(self):
+        self.capturing = False
+        self.mapping_active = False
+        self.calibration_mode = False
+        
+        # Release any active mouse buttons
+        try:
+            pyautogui.mouseUp()
+        except:
+            pass
+        
+        for i in range(2):
+            if self.screen_windows[i] is not None:
+                try:
+                    self.screen_windows[i].destroy()
+                    self.screen_windows[i] = None
+                    self.screen_labels[i] = None
+                except:
+                    pass
+                
+        cv2.destroyAllWindows()
+                
+        self.stop_button.config(state=tk.DISABLED)
+        
+        session_duration = datetime.now() - self.session_start_time
+        print(f"Fast session ended for user {self.current_user}. Duration: {session_duration}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ScreenFieldControlApp(root)
+    root.mainloop()
