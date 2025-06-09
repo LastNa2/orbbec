@@ -1,0 +1,12 @@
+install the system requirements below
+https://aka.ms/vs/17/release/vc_redist.x64.exe
+https://dl.orbbec3d.com/dist/openni2/v2.3.0.86-beta6/Orbbec_OpenNI_v2.3.0.86-beta6_windows_release.zip
+https://dl.orbbec3d.com/dist/drivers/win32/astra-win32-driver-4.3.0.22.zip
+
+look through the file manager and find the path of OpenNI2.dll (e.g. "OpenNI_2.3.0.86_202210111950_4c8f5aa4_beta6_windows\Win64-Release\sdk\libs") and paste it in the OPENNI_PATH in the class Config
+paste this in the terminal of vs code: pip install numpy opencv-python pywin32 mediapipe tk Pillow openni
+
+when the program is running in the compiler, start by clicking the "Choose Screen Field 1" button and choose the desired part of the screen to control. 
+this will trigger an action like the snipping tool to choose the desired area of the screen. do the same for region 2.
+
+then click the "3D Square Mapping 1" to map the screen area of the cube
