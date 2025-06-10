@@ -10,3 +10,15 @@ when the program is running in the compiler, start by clicking the "Choose Scree
 this will trigger an action like the snipping tool to choose the desired area of the screen. do the same for region 2.
 
 then click the "3D Square Mapping 1" to map the screen area of the cube
+when camera opens, click at the corners of the cube in the camera window.
+the sequence of clicking at the corner should look like this:
+              
+              1st --------------- 2nd
+              |                    |
+              |                    |
+              |                    |
+              |                    |
+              4th-----------------3rd
+
+then press the number 2 key to map the 2nd screen.
+
